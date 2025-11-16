@@ -4,11 +4,14 @@ import tiktoken
 from openai import OpenAI
 from pinecone import Pinecone, ServerlessSpec
 
+# this is just GPT'd i will fix it later
 # --------------------------------------
 # CONFIGURATION
 # --------------------------------------
-OPENAI_API_KEY = "OPENAI-API-KEY"
-PINECONE_API_KEY = "PINECONE-API-KEY"
+# Better: read keys from env vars instead of hard-coding
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "OPENAI-API-KEY")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "PINECONE-API-KEY")
+
 TRANSCRIPT_DIR = r"D:\transcript_dataset"
 
 INDEX_NAME = "claims-index"
@@ -25,13 +28,18 @@ encoder = tiktoken.get_encoding("cl100k_base")
 # Create Pinecone client instance
 pc = Pinecone(api_key=PINECONE_API_KEY)
 
+# --------------------------------------
 # Ensure index exists
-if INDEX_NAME not in pc.list_indexes().names():
+# IMPORTANT: embedding dim for text-embedding-3-small is 1536 by default
+# so Pinecone index must also be 1536-dimensional.
+# --------------------------------------
+if not pc.has_index(INDEX_NAME):
     pc.create_index(
         name=INDEX_NAME,
-        dimension=512,
+        vector_type="dense",
+        dimension=1536,
         metric="cosine",
-        spec=ServerlessSpec(cloud="aws", region="us-east-1")
+        spec=ServerlessSpec(cloud="aws", region="us-east-1"),
     )
 
 # Get index handle
@@ -40,7 +48,7 @@ index = pc.Index(INDEX_NAME)
 # --------------------------------------
 # Step 1 - Extract Claim–Response Pairs
 # --------------------------------------
-def extract_pairs(transcript_text):
+def extract_pairs(transcript_text: str):
     system_prompt = """
     Extract CLAIM–RESPONSE pairs from the transcript.
 
@@ -56,107 +64,177 @@ def extract_pairs(transcript_text):
 
     If timestamps are missing, estimate start/end roughly by order.
     """
+
     result = client.chat.completions.create(
         model=GPT_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": transcript_text}
+            {"role": "user", "content": transcript_text},
         ],
-        temperature=0
+        temperature=0,
     )
 
-    text = result.choices[0].message.content
-    return json.loads(text)
+    text = result.choices[0].message.content.strip()
+
+    # --- Make JSON parsing a bit more robust (handles ```json fences etc.) ---
+    # Grab the first JSON array in the response.
+    try:
+        # Try direct parse first
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Very simple "extract JSON array" fallback
+        start = text.find("[")
+        end = text.rfind("]")
+        if start != -1 and end != -1 and end > start:
+            json_str = text[start : end + 1]
+            return json.loads(json_str)
+        raise
+
 
 # --------------------------------------
 # Step 2 - Token-based Chunking
+#   We pack multiple pairs into chunks of ~MAX_TOKENS and
+#   preserve both claim and response in metadata for RAG.
 # --------------------------------------
-def chunk_pairs(pairs, video_id):
+def chunk_pairs(pairs, video_id: str):
     chunks = []
     cur_tokens = []
-    cur_meta = []
+    cur_pairs = []
 
     def flush():
         if not cur_tokens:
             return
         text = encoder.decode(cur_tokens)
-        chunks.append({
-            "text": text,
-            "metadata": {
-                "video_id": video_id,
-                "pairs": cur_meta.copy()
+        # Store text also in metadata so we can show it at query time
+        chunks.append(
+            {
+                "text": text,
+                "metadata": {
+                    "video_id": video_id,
+                    "pairs": cur_pairs.copy(),
+                },
             }
-        })
+        )
         cur_tokens.clear()
-        cur_meta.clear()
+        cur_pairs.clear()
 
     for p in pairs:
-        block = json.dumps(p, ensure_ascii=False)
+        # keep full pair information
+        cur_pairs.append(
+            {
+                "claim": p.get("claim", ""),
+                "response": p.get("response", ""),
+                "start": p.get("start", 0),
+                "end": p.get("end", 0),
+            }
+        )
+        block = json.dumps(cur_pairs[-1], ensure_ascii=False)
         block_tokens = encoder.encode(block)
 
+        # if adding this block would exceed limit, flush current chunk first
         if len(cur_tokens) + len(block_tokens) > MAX_TOKENS:
             flush()
 
         cur_tokens.extend(block_tokens)
-        cur_meta.append({
-            "claim": p["claim"],
-            "start": p.get("start", 0),
-            "end": p.get("end", 0)
-        })
 
     flush()
     return chunks
+
 
 # --------------------------------------
 # Step 3 - Embedding helper
 # --------------------------------------
 def embed(text: str):
-    result = client.embeddings.create(model=EMBED_MODEL, input=text)
+    result = client.embeddings.create(
+        model=EMBED_MODEL,
+        input=text,
+    )
     return result.data[0].embedding
+
 
 # --------------------------------------
 # Step 4 - Upsert chunks into Pinecone
 # --------------------------------------
-def index_chunks(video_id, chunks):
+def index_chunks(video_id: str, chunks):
     vectors = []
     for i, ch in enumerate(chunks):
         emb = embed(ch["text"])
         vec_id = f"{video_id}-chunk-{i}"
-        vectors.append({
-            "id": vec_id,
-            "values": emb,
-            "metadata": ch["metadata"]
-        })
-    index.upsert(vectors=vectors)
-    print(f"Indexed: {video_id} → {len(vectors)} chunks")
+        # include text into metadata so we can reconstruct context later
+        metadata = dict(ch["metadata"])
+        metadata["text"] = ch["text"]
+
+        vectors.append(
+            {
+                "id": vec_id,
+                "values": emb,
+                "metadata": metadata,
+            }
+        )
+    if vectors:
+        index.upsert(vectors=vectors)
+        print(f"Indexed: {video_id} → {len(vectors)} chunks")
+    else:
+        print(f"Nothing to index for {video_id}")
+
 
 # --------------------------------------
 # Step 5 - RAG Query
 # --------------------------------------
-def rag_query(query: str, top_k=5):
+def rag_query(query: str, top_k: int = 5):
     q_emb = embed(query)
-    results = index.query(vector=q_emb, top_k=top_k, include_metadata=True)
+    results = index.query(
+        vector=q_emb,
+        top_k=top_k,
+        include_metadata=True,
+    )
 
-    retrieved_context = json.dumps(results.matches, indent=2)
+    # Pinecone returns match objects that aren't JSON-serializable,
+    # so we convert them to plain dicts.
+    context_items = []
+    for m in results.matches:
+        md = m.metadata or {}
+        context_items.append(
+            {
+                "score": m.score,
+                "video_id": md.get("video_id"),
+                "text": md.get("text"),
+                "pairs": md.get("pairs", []),
+            }
+        )
+
+    retrieved_context = json.dumps(
+        context_items,
+        ensure_ascii=False,
+        indent=2,
+    )
 
     prompt = f"""
-    Answer the user's query using ONLY the retrieved context:
+You are a QA assistant over claim–response pairs from video transcripts.
 
-    Query: {query}
+Answer the user's query using ONLY the retrieved context below.
+If the context is insufficient, say you don't know.
 
-    Retrieved context:
-    {retrieved_context}
+Query:
+{query}
 
-    Include timestamps and video_id in your answer.
-    """
+Retrieved context (JSON list of chunks, with video_id, text, and pairs):
+{retrieved_context}
+
+When answering:
+- Quote / paraphrase the relevant claim–response content.
+- Include video_id and any available start/end timestamps in your answer.
+"""
 
     resp = client.chat.completions.create(
         model=GPT_MODEL,
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
     )
 
     answer = resp.choices[0].message.content
-    return answer, results.matches
+    return answer, context_items
+
 
 # --------------------------------------
 # Step 6 - Process all transcripts
@@ -171,16 +249,26 @@ def process_all_transcripts():
         with open(path, "r", encoding="utf-8") as f:
             transcript_text = f.read()
 
+        if not transcript_text.strip():
+            print("  -> Empty transcript, skipping.")
+            continue
+
         pairs = extract_pairs(transcript_text)
+        if not pairs:
+            print("  -> No pairs extracted, skipping.")
+            continue
+
         chunks = chunk_pairs(pairs, video_id)
         index_chunks(video_id, chunks)
+
 
 # --------------------------------------
 # RUN
 # --------------------------------------
 if __name__ == "__main__":
     process_all_transcripts()
+
     print("\n--- SAMPLE QUERY ---")
     ans, refs = rag_query("What did the Muslim speaker say about Hindu scriptures?")
     print("ANSWER:\n", ans)
-    print("REFERENCES:\n", refs)
+    print("\nREFERENCES:\n", json.dumps(refs, ensure_ascii=False, indent=2))
