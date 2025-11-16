@@ -1,6 +1,7 @@
 import os
 import json
 import tiktoken
+from dotenv import load_dotenv
 from openai import OpenAI
 from pinecone import Pinecone, ServerlessSpec
 
@@ -8,11 +9,11 @@ from pinecone import Pinecone, ServerlessSpec
 # --------------------------------------
 # CONFIGURATION
 # --------------------------------------
-# Better: read keys from env vars instead of hard-coding
+load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "OPENAI-API-KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "PINECONE-API-KEY")
 
-TRANSCRIPT_DIR = r"D:\transcript_dataset"
+TRANSCRIPT_DIR = "transcripts"
 
 INDEX_NAME = "claims-index"
 GPT_MODEL = "gpt-4o-mini"
@@ -44,6 +45,7 @@ if not pc.has_index(INDEX_NAME):
 
 # Get index handle
 index = pc.Index(INDEX_NAME)
+
 
 # --------------------------------------
 # Step 1 - Extract Claim–Response Pairs
@@ -86,7 +88,7 @@ def extract_pairs(transcript_text: str):
         start = text.find("[")
         end = text.rfind("]")
         if start != -1 and end != -1 and end > start:
-            json_str = text[start : end + 1]
+            json_str = text[start: end + 1]
             return json.loads(json_str)
         raise
 
@@ -160,9 +162,17 @@ def index_chunks(video_id: str, chunks):
     for i, ch in enumerate(chunks):
         emb = embed(ch["text"])
         vec_id = f"{video_id}-chunk-{i}"
-        # include text into metadata so we can reconstruct context later
-        metadata = dict(ch["metadata"])
-        metadata["text"] = ch["text"]
+
+        # Extract metadata from chunk
+        video_id_meta = ch["metadata"]["video_id"]
+        pairs = ch["metadata"]["pairs"]  # list[dict]
+
+        # Pinecone metadata must be simple types – store pairs as JSON string
+        metadata = {
+            "video_id": video_id_meta,
+            "text": ch["text"],
+            "pairs_json": json.dumps(pairs, ensure_ascii=False),
+        }
 
         vectors.append(
             {
@@ -171,6 +181,7 @@ def index_chunks(video_id: str, chunks):
                 "metadata": metadata,
             }
         )
+
     if vectors:
         index.upsert(vectors=vectors)
         print(f"Indexed: {video_id} → {len(vectors)} chunks")
@@ -189,17 +200,21 @@ def rag_query(query: str, top_k: int = 5):
         include_metadata=True,
     )
 
-    # Pinecone returns match objects that aren't JSON-serializable,
-    # so we convert them to plain dicts.
     context_items = []
     for m in results.matches:
         md = m.metadata or {}
+        pairs_json = md.get("pairs_json", "[]")
+        try:
+            pairs = json.loads(pairs_json)
+        except json.JSONDecodeError:
+            pairs = []
+
         context_items.append(
             {
                 "score": m.score,
                 "video_id": md.get("video_id"),
                 "text": md.get("text"),
-                "pairs": md.get("pairs", []),
+                "pairs": pairs,
             }
         )
 
