@@ -1,3 +1,6 @@
+import os
+
+from dotenv import load_dotenv
 from supabase import create_client, Client
 from typing import Optional, List, Dict, Any
 from openai import OpenAI
@@ -119,12 +122,19 @@ def store_formatted_transcript(
         "formatted_transcript": formatted_transcript
     }
 
-    result = supabase.table("formatted_transcripts").insert(data).execute()
+    # Use UPSERT so we can safely re-run the pipeline
+    result = (
+        supabase
+        .table("formatted_transcripts")
+        .upsert(data)  # on_conflict defaults to the PK (video_id)
+        .execute()
+    )
 
     if getattr(result, "error", None):
-        print("❌ Error saving:", result.error)
+        print("Error saving:", result.error)
     else:
-        print(f"✅ Successfully saved formatted transcript for {video_id}")
+        print(f"Successfully saved formatted transcript for {video_id}")
+
 
 
 # -------------------------
@@ -133,9 +143,11 @@ def store_formatted_transcript(
 
 if __name__ == "__main__":
 
-    SUPABASE_URL=
-    SUPABASE_SERVICE_ROLE_KEY=
-    OPENAI_API_KEY=
+    load_dotenv()
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "OPENAI-API-KEY")
+    PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "PINECONE-API-KEY")
+    SUPABASE_URL = os.getenv("SUPABASE_URL")
+    SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
     supabase = init_supabase(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     openai_client = init_openai(OPENAI_API_KEY)
@@ -158,4 +170,4 @@ if __name__ == "__main__":
         # Step 3 — Save to Supabase
         store_formatted_transcript(supabase, video_id, cleaned)
 
-    print("\n🎉 ALL TRANSCRIPTS PROCESSED SUCCESSFULLY!\n")
+    print("\nALL TRANSCRIPTS PROCESSED!\n")
