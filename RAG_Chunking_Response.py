@@ -78,8 +78,11 @@ def extract_claim_response_pairs(
 ) -> List[Dict[str, Any]]:
     """
     Use GPT to turn a cleaned, speaker-labelled transcript into
-    structured claim–response pairs. Each pair gets a stable pair_id:
-    <video_id>_<index>.
+    structured claim–response pairs.
+
+    We IGNORE any pair_id from the model and generate our own:
+    pair_id string: "<video_id>_<index:03d>"
+    pair_index: integer index starting at 1
     """
     prompt = f"""
 You are given a clean dialogue transcript between two speakers:
@@ -91,11 +94,10 @@ Your task is to extract CLAIM–RESPONSE pairs, where:
 - A "claim" is a clear statement or objection raised by either speaker.
 - A "response" is the direct reply to that claim.
 
-Return ONLY valid JSON with this exact structure:
+Return ONLY valid JSON with this structure (without pair_id):
 
 [
   {{
-    "pair_id": "VIDEOID_001",
     "claim_speaker": "Non-Muslim",
     "claim": "...",
     "response_speaker": "Muslim Lantern",
@@ -107,10 +109,9 @@ Return ONLY valid JSON with this exact structure:
 ]
 
 Rules:
-- Use pair_id = "<video_id>_XXX" with 3-digit numbering starting from 001.
+- Speakers must be exactly "Muslim Lantern" or "Non-Muslim".
 - Do NOT summarise; keep the main wording of each claim/response.
 - Use best-effort estimates for start/end seconds if timestamps are not known.
-- Speakers must be exactly "Muslim Lantern" or "Non-Muslim".
 
 Transcript:
 {formatted_transcript}
@@ -132,13 +133,13 @@ Transcript:
             raise
         data = json.loads(text[start : end + 1])
 
-    # ensure pair_ids exist / are normalized
     cleaned_pairs = []
     for i, p in enumerate(data, start=1):
-        pair_id = p.get("pair_id") or f"{video_id}_{i:03d}"
+        pair_id = f"{video_id}_{i:03d}"        # string ID used in RAG
         cleaned_pairs.append(
             {
                 "pair_id": pair_id,
+                "pair_index": i,               # numeric index for DB id
                 "video_id": video_id,
                 "claim_speaker": p.get("claim_speaker", ""),
                 "claim": p.get("claim", ""),
@@ -153,6 +154,7 @@ Transcript:
     return cleaned_pairs
 
 
+
 # -------------------------
 # STEP 6 — STORE PAIRS IN SUPABASE
 # -------------------------
@@ -160,33 +162,65 @@ Transcript:
 def store_claim_response_pairs(
     supabase: Client, pairs: List[Dict[str, Any]]
 ):
+    """
+    Store claim–response pairs in Supabase.
+
+    Table: claim_response_pairs
+    Columns:
+      - id       BIGINT (we generate a large, stable numeric key)
+      - claim    TEXT
+      - response TEXT
+    """
     if not pairs:
         return
 
     print(f"Saving {len(pairs)} claim–response pair(s) to Supabase...")
 
     rows = []
-    for p in pairs:
-        row = {
-            "id": p["pair_id"],       # PK: VIDEOID_XXX
-            "claim": p["claim"],
-            "response": p["response"],
-        }
-        rows.append(row)
+    BASE = 1_000_000  # large offset to avoid colliding with existing small IDs
 
-    # upsert avoids duplicate-key errors when re-running the pipeline
+    for i, p in enumerate(pairs, start=1):
+        vid_str = str(p.get("video_id", "0"))
+        vid_num = int(vid_str) if vid_str.isdigit() else 0
+
+        # stable numeric id: e.g. video 1, pair 1 => 1_000_001
+        pair_index = p.get("pair_index", i)
+        id_int = vid_num * BASE + pair_index
+
+        rows.append(
+            {
+                "id": id_int,
+                "claim": p["claim"],
+                "response": p["response"],
+            }
+        )
+
     result = (
         supabase
         .table("claim_response_pairs")
-        .upsert(rows)
+        .upsert(rows)  # safe to re-run
         .execute()
     )
 
     if getattr(result, "error", None):
-        print("Error saving pairs:", result.error)
+        print("❌ Error saving pairs:", result.error)
     else:
-        print("Pairs saved successfully.")
+        print("✅ Pairs saved/updated successfully.")
 
+
+
+
+def debug_print_claim_response_schema(supabase: Client):
+    print("\n=== DEBUG: claim_response_pairs sample row ===")
+    result = (
+        supabase
+        .table("claim_response_pairs")
+        .select("*")
+        .limit(1)
+        .execute()
+    )
+    data = result.data if hasattr(result, "data") else result
+    print("First row (or [] if empty):", data)
 
 
 
@@ -385,7 +419,6 @@ def evaluate_retriever(
 ):
     print("\n=== EVALUATION: Recall@k and nDCG@k ===")
 
-    # metrics[q][k] = (recall, ndcg)
     metrics: Dict[int, Dict[int, Tuple[float, float]]] = {}
 
     for qi, item in enumerate(dev_queries):
@@ -402,7 +435,6 @@ def evaluate_retriever(
             include_metadata=True,
         )
 
-        # Flatten pair_ids in retrieval order (per chunk).
         ranked_pairs: List[str] = []
         for match in res.matches:
             md = match.metadata or {}
@@ -410,15 +442,19 @@ def evaluate_retriever(
                 if pid not in ranked_pairs:
                     ranked_pairs.append(pid)
 
+        # DEBUG: show what we're comparing
+        print("\n--- DEV QUERY DEBUG ---")
+        print("Query:", query)
+        print("Relevant (labels):", sorted(list(relevant)))
+        print("Top-k retrieved pair_ids:", ranked_pairs[:max_k])
+
         metrics[qi] = {}
         for k in k_values:
             top_k_pairs = ranked_pairs[:k]
-            # Recall@k
             retrieved_set = set(top_k_pairs)
             intersection = len(retrieved_set & relevant)
             recall_k = intersection / len(relevant)
 
-            # nDCG@k
             relevances = [1 if pid in relevant else 0 for pid in top_k_pairs]
             dcg_k = dcg(relevances)
             ideal_rels = [1] * min(len(relevant), k)
@@ -462,6 +498,7 @@ if __name__ == "__main__":
     openai_client = init_openai(OPENAI_API_KEY)
     pc, pinecone_index = init_pinecone(PINECONE_API_KEY)
 
+    debug_print_claim_response_schema(supabase)
     # ----- Ingestion: formatted transcripts -> pairs -> chunks -> Pinecone -----
 
     formatted_items = get_formatted_transcripts(supabase)
@@ -495,12 +532,63 @@ if __name__ == "__main__":
     # ----- Example dev set & metrics -----
     DEV_QUERIES = [
         {
-            "query": "How did the Muslim respond to the claim that all religions are the same?",
-            "relevant_pair_ids": ["VIDEO1_001", "VIDEO1_002"],
+            "query": "Why is Hinduism not right?",
+            "relevant_pair_ids": ["3_001", "3_002"],  # from Hinduism chunk
         },
         {
-            "query": "What objection about the Trinity was raised?",
-            "relevant_pair_ids": ["VIDEO2_003"],
+            "query": "Why is the Quran followed so exactly?",
+            "relevant_pair_ids": ["3_004", "3_005"],  # from Quran vs Bible chunk
+        },
+        {
+            # Moral relativism / culture & "organized religion"
+            "query": "What does the Muslim speaker say about morality depending on culture and organized religion?",
+            "relevant_pair_ids": ["3_003"],
+        },
+        {
+            # Quran preserved, valid until end of times
+            "query": "Why does the Muslim speaker say the Quran is preserved and valid until the end of times?",
+            "relevant_pair_ids": ["3_004"],
+        },
+        {
+            # Quran followed vs Christians not following Bible
+            "query": "How does the Muslim speaker compare Muslims following the Quran to Christians following the Bible?",
+            "relevant_pair_ids": ["3_005"],
+        },
+        {
+            # Buddha vs Prophet Muhammad
+            "query": "How does the Muslim speaker respond to the idea that Buddha could be like a prophet?",
+            "relevant_pair_ids": ["2_002"],
+        },
+        {
+            # Is all the information in the Quran?
+            "query": "Is all the information and evidences for Islam contained in the Quran?",
+            "relevant_pair_ids": ["2_003"],
+        },
+        {
+            # People who never received the message
+            "query": "What does the Muslim speaker say happens to people who never received the message in this life?",
+            "relevant_pair_ids": ["1_015"],
+        },
+        {
+            # Advice about reading the Quran
+            "query": "What advice does the Muslim speaker give about reading the Quran?",
+            "relevant_pair_ids": ["1_016"],
+        },
+        {
+            # General question about the Quran being outdated or ancient
+            "query": "How does the Muslim speaker answer the claim that parts of the Quran might be outdated or ancient?",
+            "relevant_pair_ids": ["3_004"],
+        },
+        {
+            # Why Prophet Muhammad instead of generic enlightened figure
+            "query": "Why does the Muslim speaker argue that Prophet Muhammad cannot just be an enlightened person like Buddha?",
+            "relevant_pair_ids": ["2_002"],
+        },
+        {
+            # Evidence / prophecies question
+            "query": "What evidences and prophecies does the Muslim speaker mention as reasons to believe Islam is true?",
+            "relevant_pair_ids": ["2_003"],
         },
     ]
+
     evaluate_retriever(openai_client, pinecone_index, DEV_QUERIES, k_values=[3, 5])
