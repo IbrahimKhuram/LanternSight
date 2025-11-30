@@ -505,7 +505,7 @@ if __name__ == "__main__":
 
     for item in formatted_items:
         video_id = item["video_id"]
-        formatted_text = item["formatted_transcript"]
+        formatted_text = item["clean_text"]
 
         print("\n============================")
         print(f"PROCESSING VIDEO FOR RAG: {video_id}")
