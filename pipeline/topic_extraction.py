@@ -16,7 +16,7 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not SUPABASE_URL:
-    raise ValueError("SUPABASE_URL is missing — is your .env loaded?")
+    raise ValueError("SUPABASE_URL is missing — check your .env")
 if not SUPABASE_SERVICE_ROLE_KEY:
     raise ValueError("SUPABASE_SERVICE_ROLE_KEY is missing.")
 if not OPENAI_API_KEY:
@@ -46,27 +46,34 @@ def fetch_clean_transcript(video_id: str) -> str:
 
 
 # -----------------------------------------------------
-# GPT STAGE 1 — Extract Topics Only
+# GPT STAGE 1 — Extract Non-Muslim Objections + Timestamps
 # -----------------------------------------------------
 
-def extract_topics_only(clean_text: str) -> str:
+def extract_objections(clean_text: str) -> str:
 
     SYSTEM_MESSAGE = """
-You identify ONLY the topics raised in a Muslim Lantern dawah conversation.
+Extract a list of Non-Muslim objections that Muslim Lantern refuted from a Muslim Lantern dawah conversation.
 
-RULES:
-- Extract ONLY topic titles/questions/claims/objections.
-- DO NOT extract Muslim Lantern’s answers.
-- DO NOT paraphrase.
-- DO NOT add new topics.
-- Keep original order.
-- Output MUST be:
+Go through the video transcript and:
+- Identify the Non-Muslim objection.
+- Identify timestamp_start = when the objection begins.
+- Identify timestamp_end = when Muslim Lantern COMPLETES refuting that objection.
 
-topic 1: <topic>
-topic 2: <topic>
-topic 3: <topic>
 
-No explanations. No markdown. No answers.
+Output format:
+
+topic 1:
+objection: <non-muslim objection>
+timestamp_start: <HH:MM:SS or MM:SS>
+timestamp_end: <HH:MM:SS or MM:SS>
+
+topic 2:
+objection: <non-muslim objection>
+timestamp_start: <HH:MM:SS or MM:SS>
+timestamp_end: <HH:MM:SS or MM:SS>
+
+(continue)
+
 """
 
     response = client.responses.create(
@@ -81,52 +88,90 @@ No explanations. No markdown. No answers.
     return response.output_text.strip()
 
 
-
 # -----------------------------------------------------
-# Parse stage-1 output (extract topic text only)
+# Parse stage-1 output
 # -----------------------------------------------------
 
-def parse_topics_list(raw: str):
+def parse_stage1(raw: str):
+    """
+    Returns a list of:
+    [
+        {
+            "topic_num": 1,
+            "objection": "...",
+            "timestamp_start": "...",
+            "timestamp_end": "..."
+        },
+        ...
+    ]
+    """
     topics = []
-    for line in raw.split("\n"):
-        line = line.strip()
-        if not line:
+
+    # Case-insensitive split on 'topic '
+    blocks = re.split(r'(?i)topic ', raw)
+
+    for block in blocks:
+        block = block.strip()
+        if not block or not block[0].isdigit():
             continue
 
-        match = re.match(r"topic\s*\d+\s*:\s*(.+)", line, re.IGNORECASE)
-        if match:
-            topics.append(match.group(1).strip())
+        lines = [l.strip() for l in block.split("\n") if l.strip()]
+
+        # Extract numeric topic number safely
+        match = re.match(r'(\d+)', lines[0])
+        if not match:
+            continue
+        topic_num = int(match.group(1))
+
+        obj = ""
+        ts_start = ""
+        ts_end = ""
+
+        for line in lines[1:]:
+            if line.lower().startswith("objection:"):
+                obj = line.split(":", 1)[1].strip()
+            elif line.lower().startswith("timestamp_start"):
+                ts_start = line.split(":", 1)[1].strip()
+            elif line.lower().startswith("timestamp_end"):
+                ts_end = line.split(":", 1)[1].strip()
+
+        topics.append({
+            "topic_num": topic_num,
+            "objection": obj,
+            "timestamp_start": ts_start,
+            "timestamp_end": ts_end
+        })
 
     return topics
 
 
-
 # -----------------------------------------------------
-# GPT STAGE 2 — Extract Muslim Lantern Answers
+# GPT STAGE 2 — Extract EXACT Muslim Lantern Refutations
 # -----------------------------------------------------
 
-def extract_answers_for_topics(clean_text: str, topics: list[str]) -> str:
+def extract_refutations(clean_text: str, stage1_rows: list[dict]) -> str:
 
     SYSTEM_MESSAGE = """
-Extract EXACT Muslim Lantern responses for each topic.
+Extract the EXACT wording of Muslim Lantern's refutation for each Non-Muslim objection.
 
 RULES:
-- Use EXACT wording from transcript (no paraphrasing).
-- Include ALL lines spoken by Muslim Lantern relevant to the topic.
-- Exclude non-Muslim speech completely.
-- Keep chronological order.
-- Output MUST follow EXACTLY:
+- Use verbatim transcript text (NO paraphrasing).
+- Include ALL lines spoken by Muslim Lantern that are part of the refutation.
+- Exclude ALL Non-Muslim lines.
+- Use objection timestamps to find the refutation section.
 
-topic 1: <topic>
-Muslim Lantern answer:
-<exact answer>
+Output exactly:
 
-topic 2: <topic>
-Muslim Lantern answer:
-<exact answer>
+topic 1:
+Muslim Lantern refutation:
+<exact text>
+
+topic 2:
+Muslim Lantern refutation:
+<exact text>
 """
 
-    topics_text = "\n".join([f"- {t}" for t in topics])
+    topics_text = "\n".join([f"topic {row['topic_num']}: {row['objection']}" for row in stage1_rows])
 
     response = client.responses.create(
         model="gpt-4.1",
@@ -134,7 +179,7 @@ Muslim Lantern answer:
             {"role": "system", "content": SYSTEM_MESSAGE},
             {
                 "role": "user",
-                "content": f"TOPICS:\n{topics_text}\n\nTRANSCRIPT:\n{clean_text}",
+                "content": f"OBJECTIONS:\n{topics_text}\n\nTRANSCRIPT:\n{clean_text}",
             },
         ],
         temperature=0,
@@ -143,57 +188,55 @@ Muslim Lantern answer:
     return response.output_text.strip()
 
 
-
 # -----------------------------------------------------
-# Parse FULL topic + answer output
+# Parse Stage 2 (refutations)
 # -----------------------------------------------------
 
-def parse_topics_output(raw: str):
-    lines = [l.strip() for l in raw.split("\n") if l.strip()]
-
+def parse_stage2(raw: str):
+    """
+    Returns:
+    [
+        {
+            "topic_num": 1,
+            "answer": "exact refutation"
+        },
+        ...
+    ]
+    """
     results = []
-    current_topic = None
-    current_answer = []
+    blocks = re.split(r'(?i)topic ', raw)  # case-insensitive split
 
-    topic_re = re.compile(r"^topic\s*\d+\s*:\s*(.+)$", re.IGNORECASE)
-    answer_re = re.compile(r"^Muslim Lantern answer\s*:\s*(.*)$", re.IGNORECASE)
-
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-
-        t = topic_re.match(line)
-        if t:
-            if current_topic and current_answer:
-                results.append({
-                    "topic": current_topic,
-                    "answer": "\n".join(current_answer).strip()
-                })
-            current_topic = t.group(1).strip()
-            current_answer = []
-            i += 1
+    for block in blocks:
+        block = block.strip()
+        if not block or not block[0].isdigit():
             continue
 
-        a = answer_re.match(line)
-        if a:
-            first_line = a.group(1).strip()
-            if first_line:
-                current_answer.append(first_line)
+        lines = [l.strip() for l in block.split("\n") if l.strip()]
 
-            i += 1
-            while i < len(lines):
-                if topic_re.match(lines[i]):
-                    break
-                current_answer.append(lines[i])
-                i += 1
+        # Extract numeric topic number safely
+        match = re.match(r'(\d+)', lines[0])
+        if not match:
             continue
+        topic_num = int(match.group(1))
 
-        i += 1
+        # find "Muslim Lantern refutation:"
+        ref_lines = []
+        start = False
+        for line in lines[1:]:
+            if line.lower().startswith("muslim lantern refutation"):
+                # may have text after colon
+                after = line.split(":", 1)[1].strip()
+                if after:
+                    ref_lines.append(after)
+                start = True
+                continue
 
-    if current_topic and current_answer:
+            if start:
+                ref_lines.append(line)
+
         results.append({
-            "topic": current_topic,
-            "answer": "\n".join(current_answer).strip()
+            "topic_num": topic_num,
+            "answer": "\n".join(ref_lines).strip()
         })
 
     return results
@@ -201,18 +244,34 @@ def parse_topics_output(raw: str):
 
 
 # -----------------------------------------------------
-# Save in Supabase
+# SAVE FINAL MERGED ROWS INTO SUPABASE
 # -----------------------------------------------------
 
-def save_topics(video_id: str, topic_rows: list[dict]):
+def save_topics(video_id: str, stage1_rows: list[dict], stage2_rows: list[dict]):
 
-    # Add video_id to each row
-    for row in topic_rows:
-        row["video_id"] = video_id
+    # Build lookup for answers
+    answers_by_num = {
+        row["topic_num"]: row["answer"]
+        for row in stage2_rows
+    }
 
+    # Merge into final rows
+    merged_rows = []
+    for row in stage1_rows:
+        num = row["topic_num"]
+        merged_rows.append({
+            "video_id": video_id,
+            "topic_num": num,
+            "topic": row["objection"],  # Non-Muslim objection
+            "answer": answers_by_num.get(num, ""),  # EXACT refutation
+            "timestamp_start": row["timestamp_start"],
+            "timestamp_end": row["timestamp_end"]
+        })
+
+    # Insert
     response = (
         supabase.table("topical_answers")
-        .insert(topic_rows)
+        .insert(merged_rows)
         .execute()
     )
 
@@ -220,5 +279,3 @@ def save_topics(video_id: str, topic_rows: list[dict]):
         raise Exception(f"Error saving topics: {response.error}")
 
     return response.data
-
-
