@@ -19,7 +19,7 @@ def clean_one_video(video_id: str):
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: python clean_one.py <video_id>")
+        print("Usage: python -m single_video_tools.clean_one <video_id>")
         sys.exit(1)
 
     video_id = sys.argv[1]

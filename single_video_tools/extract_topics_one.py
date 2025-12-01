@@ -1,71 +1,87 @@
 # single_video_tools/extract_topics_one.py
 
 import sys
+import traceback
 from pipeline.topic_extraction import (
     fetch_clean_transcript,
     extract_objections,
-    parse_stage1,
-    extract_refutations,
-    parse_stage2,
-    save_topics,
+    parse_objections,
+    save_topics
 )
 
-def process_one(video_id: str):
-    print(f"\n--- Extracting topics for video_id = {video_id} ---")
+# ------------------------------------------
+# MAIN PIPELINE FUNCTION
+# ------------------------------------------
+
+def process_video(video_id: str):
 
     # ------------------------------------------
-    # 1. Fetch cleaned transcript
+    # Step 1 — Fetch Clean Transcript
     # ------------------------------------------
-    print("Fetching cleaned transcript...")
-    clean_text = fetch_clean_transcript(video_id)
 
-    # ------------------------------------------
-    # 2. Stage 1 — Extract objections + timestamps
-    # ------------------------------------------
-    print("Running GPT Stage 1 (objection extraction)...")
-    stage1_raw = extract_objections(clean_text)
-    stage1_rows = parse_stage1(stage1_raw)
-
-    print(f"Found {len(stage1_rows)} objections.")
-
-    # Print objections with timestamps
-    print("Objections with timestamps:")
-    for row in stage1_rows:
-        print(f"- Topic {row['topic_num']}: {row['objection']}")
-        print(f"  Start: {row['timestamp_start']}, End: {row['timestamp_end']}\n")
+    print(f"\n=== Extracting topics for video: {video_id} ===")
+    try:
+        clean_text = fetch_clean_transcript(video_id)
+        print("✓ Clean transcript fetched")
+    except Exception as e:
+        print(f"ERROR fetching clean transcript: {e}")
+        traceback.print_exc()
+        return
 
     # ------------------------------------------
-    # 3. Stage 2 — Extract exact ML refutations
+    # Step 2 — GPT Stage 1 (Extract Objections)
     # ------------------------------------------
-    print("Running GPT Stage 2 (refutation extraction)...")
-    stage2_raw = extract_refutations(clean_text, stage1_rows)
 
-    # Print raw Stage 2 output
-    print("\n--- Raw Stage 2 Output ---\n")
-    print(stage2_raw)
-    print("\n--- End of Raw Stage 2 Output ---\n")
-
-    stage2_rows = parse_stage2(stage2_raw)
-
-    # Print structured Stage 2 output
-    print("Structured Stage 2 Output:")
-    for row in stage2_rows:
-        print(f"- Topic {row['topic_num']}:")
-        print(f"{row['answer']}\n")
+    print("Extracting objections from transcript...")
+    try:
+        stage1_raw = extract_objections(clean_text)
+        print("✓ Objection extraction completed")
+        print("List of objections (raw GPT output):\n", stage1_raw)
+    except Exception as e:
+        print(f"ERROR during GPT objection extraction: {e}")
+        traceback.print_exc()
+        return
 
     # ------------------------------------------
-    # 4. Save to Supabase
+    # Step 3 — Parse Stage 1 Output Robustly
     # ------------------------------------------
-    print("Saving topics to Supabase...")
-    save_topics(video_id, stage1_rows, stage2_rows)
 
-    print("\n✓ DONE — Topics successfully extracted and saved.\n")
+    print("Parsing GPT output...")
+    try:
+        stage1_rows = parse_objections(stage1_raw)
+        print(f"✓ Parsed {len(stage1_rows)} objections")
+    except Exception as e:
+        print(f"ERROR parsing objections: {e}")
+        traceback.print_exc()
+        return
 
+    if not stage1_rows:
+        print("!!! No objections found — stopping.")
+        return
+
+    # ------------------------------------------
+    # Step 4 — Save Into Supabase (with refutations)
+    # ------------------------------------------
+
+    print("Saving topical answers into Supabase...")
+    try:
+        result = save_topics(video_id, stage1_rows, clean_text)
+        print(f"✓ Saved {len(result)} topical answers into Supabase")
+        print("Done.\n")
+    except Exception as e:
+        print(f"ERROR saving topics: {e}")
+        traceback.print_exc()
+
+
+# ------------------------------------------
+# CLI USAGE
+# ------------------------------------------
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python -m single_video_tools.extract_topics_one <video_id>")
         sys.exit(1)
 
-    video_id = sys.argv[1]
-    process_one(video_id)
+    video_id = sys.argv[1].strip()
+    process_video(video_id)
+

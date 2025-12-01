@@ -65,22 +65,23 @@ RULES:
 - Remove filler words like “uh”, “umm”, “you know” unless meaningful.
 - Do NOT shorten or summarize the content — keep the full conversation.
 - Keep responses in natural speaking style.
-- Keep timestamps exactly as they appear. If a timestamp is present, attach it to that line.
+- Keep all timestamps exactly as they appear. If a timestamp is present, attach it to that line.
 
-OUTPUT FORMAT (MUST FOLLOW EXACTLY):
+Output format (MUST FOLLOW EXACTLY):
 
-[timestamp] Muslim Lantern: ...
-[timestamp] Non-Muslim: ...
-[timestamp] Muslim Lantern: ...
-[timestamp] Non-Muslim: ...
+[timestamp] Speaker: cleaned dialogue line
+[timestamp] Speaker: cleaned dialogue line
+[timestamp] Speaker: cleaned dialogue line
 (continue)
+
 """
 
     response = client.responses.create(
-        model="gpt-4.1",
+        model="gpt-4.1", #gpt-5
+        #reasoning={"effort": "medium"},
         input=[
             {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-            {"role": "user", "content": raw_text}
+            {"role": "user", "content": f"RAW TRANSCRIPT:\n{raw_text}"}
         ],
         temperature=0
     )
