@@ -224,19 +224,102 @@ Return JSON: {{"supported": true/false, "reasoning": "..."}}
         score = verified_count / len(citations) if citations else 0.0
         return citations, score
 
+    def filter_context(self, query: str, context_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Use an LLM to filter out irrelevant context items.
+        Returns a list of only the relevant items.
+        """
+        if not context_items:
+            return []
+
+        # Prepare prompt
+        items_str = ""
+        for i, item in enumerate(context_items):
+            # Extract text representation
+            text = ""
+            for p in item.get("pairs", []):
+                text += f"Claim: {p.get('claim')}\nResponse: {p.get('response')}\n"
+            if not text:
+                text = item.get("text", "")
+            
+            items_str += f"Item {i}:\n{text}\n---\n"
+
+        prompt = f"""
+You are a relevance classifier.
+User Query: "{query}"
+
+Below is a list of retrieved context items.
+Identify which items are relevant to answering the query.
+Return the indices of relevant items as a JSON list of integers.
+If none are relevant, return [].
+
+Items:
+{items_str}
+
+Output JSON:
+"""
+        try:
+            resp = self.openai_client.chat.completions.create(
+                model=GPT_RAG_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.0
+            )
+            data = json.loads(resp.choices[0].message.content)
+            indices = data.get("indices", [])
+            if not isinstance(indices, list):
+                # Handle case where model might return {"relevant_indices": ...} or similar if it hallucinates key
+                # But with json mode and simple prompt it's usually stable.
+                # Let's try to find any list in values.
+                for v in data.values():
+                    if isinstance(v, list):
+                        indices = v
+                        break
+            
+            relevant_items = []
+            for idx in indices:
+                if isinstance(idx, int) and 0 <= idx < len(context_items):
+                    relevant_items.append(context_items[idx])
+            
+            return relevant_items
+        except Exception as e:
+            print(f"Filtering failed: {e}")
+            return context_items # Fallback to all items
+
     def query(self, user_query: str) -> RAGResponse:
         start_time = time.time()
         
-        context = self.retrieve(user_query)
-        answer = self.generate_answer(user_query, context)
-        citations, score = self.verify_citations(answer, context)
+        # 1. Retrieve
+        raw_context = self.retrieve(user_query, top_k=10) # Fetch more to filter
         
+        # 2. Rerank / Filter (Abstention on weak evidence)
+        filtered_context = self.filter_context(user_query, raw_context)
+        
+        if not filtered_context:
+            return RAGResponse(
+                answer="I cannot answer this based on the available information (No relevant context found).",
+                citations=[],
+                context_used=[],
+                faithfulness_score=1.0, # Technically faithful to the "no info" state
+                latency_seconds=time.time() - start_time
+            )
+
+        # 3. Generate
+        answer = self.generate_answer(user_query, filtered_context)
+        
+        # 4. Verify
+        citations, score = self.verify_citations(answer, filtered_context)
+        
+        # Post-hoc Abstention: If score is very low and answer is not a refusal
+        if score < 0.3 and "I cannot answer" not in answer:
+             answer += "\n\n[Warning: The citations provided could not be fully verified against the source text.]"
+
         latency = time.time() - start_time
         
         return RAGResponse(
             answer=answer,
             citations=citations,
-            context_used=context,
+            context_used=filtered_context,
             faithfulness_score=score,
             latency_seconds=latency
         )

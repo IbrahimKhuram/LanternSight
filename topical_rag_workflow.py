@@ -14,9 +14,9 @@ from supabase import create_client
 load_dotenv()
 
 # Configuration
-INDEX_NAME = "claims-index"
+INDEX_NAME = "claims-index-large" # New index for large embeddings
 NAMESPACE = "topical-answers"
-EMBED_MODEL = "text-embedding-3-small"
+EMBED_MODEL = "text-embedding-3-large"
 GPT_MODEL = "gpt-4.1-mini"
 VERIFICATION_MODEL = "gpt-4.1-mini"
 
@@ -43,10 +43,11 @@ class TopicalRAG:
         
         # Ensure index exists
         if not self.pc.has_index(INDEX_NAME):
+            print(f"Creating index {INDEX_NAME} with dimension 3072...")
             self.pc.create_index(
                 name=INDEX_NAME,
                 vector_type="dense",
-                dimension=1536,
+                dimension=3072, # text-embedding-3-large
                 metric="cosine",
                 spec=ServerlessSpec(cloud="aws", region="us-east-1"),
             )
@@ -65,7 +66,7 @@ class TopicalRAG:
         return resp.data[0].embedding
 
     def ingest(self):
-        print("\n=== STARTING INGESTION ===")
+        print("\n=== STARTING INGESTION (Large Embeddings) ===")
         print("Fetching data from 'topical_answers'...")
         
         res = self.supabase.table("topical_answers").select("*").execute()
@@ -112,17 +113,12 @@ class TopicalRAG:
         """
         Verify citations in the format [video_id:start_time-end_time].
         """
-        # Regex to capture [video_id:start-end]
-        # Assuming video_id is UUID or string, timestamps are strings.
-        # Example: [abc-123:10:00-12:00]
-        # Let's make it flexible: [ID:Time]
         citation_pattern = r"\[([a-zA-Z0-9-]+):([^\]]+)\]"
         matches = re.findall(citation_pattern, answer)
         
         if not matches:
              return [], 1.0 if "I cannot answer" in answer else 0.0
 
-        # Map video_id to source content
         vid_to_source = {}
         for s in sources:
             vid = s.get("video_id")
@@ -133,7 +129,6 @@ class TopicalRAG:
         verified_count = 0
 
         for vid, time_range in matches:
-            # Parse start/end from time_range "start-end"
             if "-" in time_range:
                 ts_start, ts_end = time_range.split("-", 1)
             else:
@@ -179,6 +174,65 @@ Return JSON: {{"supported": true/false, "reasoning": "..."}}
         score = verified_count / len(citations) if citations else 0.0
         return citations, score
 
+    def filter_context(self, query: str, context_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Use an LLM to filter out irrelevant context items.
+        """
+        if not context_items:
+            return []
+
+        items_str = ""
+        for i, item in enumerate(context_items):
+            # Truncate content for prompt efficiency
+            content = f"Topic: {item['topic']}\nAnswer: {item['answer']}"
+            if len(content) > 1000:
+                content = content[:1000] + "..."
+            items_str += f"Item {i}:\n{content}\n---\n"
+
+        prompt = f"""
+You are a relevance classifier.
+User Query: "{query}"
+
+Below is a list of retrieved context items.
+Select ALL items that are potentially relevant or useful to answering the query.
+Be inclusive: if an item mentions concepts related to the query, include it.
+Return the indices of relevant items as a JSON list of integers.
+If none are relevant, return [].
+
+Items:
+{items_str}
+
+Output JSON:
+"""
+        try:
+            resp = self.openai_client.chat.completions.create(
+                model=GPT_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.0
+            )
+            data = json.loads(resp.choices[0].message.content)
+            indices = data.get("indices", [])
+            if not isinstance(indices, list):
+                for v in data.values():
+                    if isinstance(v, list):
+                        indices = v
+                        break
+            
+            relevant_items = []
+            for idx in indices:
+                if isinstance(idx, int) and 0 <= idx < len(context_items):
+                    relevant_items.append(context_items[idx])
+            
+            # Fallback: If filter removes everything but we had results, keep the top 1 just in case
+            if not relevant_items and context_items:
+                return [context_items[0]]
+            
+            return relevant_items
+        except Exception as e:
+            print(f"Filtering failed: {e}")
+            return context_items
+
     def query(self, user_query: str, top_k: int = 3) -> TopicalResult:
         start_time = time.time()
         
@@ -186,17 +240,30 @@ Return JSON: {{"supported": true/false, "reasoning": "..."}}
         q_emb = self.embed_text(user_query)
         results = self.index.query(
             vector=q_emb,
-            top_k=top_k,
+            top_k=20, # Fetch significantly more for filtering
             namespace=NAMESPACE,
             include_metadata=True
         )
         
-        sources = []
-        context_str = ""
+        raw_sources = [m.metadata for m in results.matches]
         
-        for m in results.matches:
-            md = m.metadata
-            sources.append(md)
+        # 2. Rerank / Filter
+        filtered_sources = self.filter_context(user_query, raw_sources)
+        
+        # Limit to top_k after filtering to keep context size manageable
+        filtered_sources = filtered_sources[:top_k]
+        
+        if not filtered_sources:
+             return TopicalResult(
+                answer="I cannot answer this based on the available information (No relevant context found).",
+                citations=[],
+                sources=[],
+                faithfulness_score=1.0,
+                latency=time.time() - start_time
+            )
+
+        context_str = ""
+        for md in filtered_sources:
             context_str += f"""
 Video ID: {md['video_id']}
 Timestamps: {md['timestamp_start']} - {md['timestamp_end']}
@@ -205,7 +272,7 @@ Answer: {md['answer']}
 ---
 """
 
-        # 2. Generate
+        # 3. Generate
         system_prompt = """You are a helpful assistant. Answer the user's question using the provided context.
 Rules:
 1. Answer using ONLY the provided context.
@@ -226,27 +293,43 @@ Rules:
         )
         answer = resp.choices[0].message.content
         
-        # 3. Verify
-        citations, score = self.verify_citations(answer, sources)
+        # 4. Verify
+        citations, score = self.verify_citations(answer, filtered_sources)
+        
+        # Post-hoc Abstention
+        if score < 0.3 and "I cannot answer" not in answer:
+             answer += "\n\n[Warning: The citations provided could not be fully verified against the source text.]"
         
         latency = time.time() - start_time
         return TopicalResult(
             answer=answer, 
             citations=citations, 
-            sources=sources, 
+            sources=filtered_sources, 
             faithfulness_score=score, 
             latency=latency
         )
-
 if __name__ == "__main__":
     rag = TopicalRAG()
     
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "ingest":
-        rag.ingest()
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "ingest":
+            rag.ingest()
+        else:
+            # Treat all args as the query
+            q = " ".join(sys.argv[1:])
+            print(f"Query: {q}")
+            
+            res = rag.query(q)
+            print("\n=== ANSWER ===")
+            print(res.answer)
+            print(f"\nFaithfulness: {res.faithfulness_score:.2f}")
+            print("\n=== CITATIONS ===")
+            for c in res.citations:
+                print(f"- [{c.video_id}:{c.timestamp_start}-{c.timestamp_end}] Faithful: {c.is_faithful}")
     else:
-        print("Usage: python topical_rag_workflow.py [ingest]")
-        print("Running test query...\n")
+        print("Usage: python topical_rag_workflow.py [ingest] OR [query string]")
+        print("Running default test query...\n")
         
         q = "What is the speaker's view on evolution?"
         print(f"Query: {q}")
