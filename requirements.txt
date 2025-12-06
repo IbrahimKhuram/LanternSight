@@ -1,0 +1,7 @@
+openai
+pinecone
+python-dotenv
+fastapi
+uvicorn
+tiktoken
+supabase
